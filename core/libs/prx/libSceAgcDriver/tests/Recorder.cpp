@@ -7014,6 +7014,151 @@ void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
     std::cout << "unchanged CPU stamps: ok\n";
 }
 
+void mixedCpuEdgeTests(const Device& device, Recorder& recorder, bool direct, std::string_view entry = "write-back") {
+    const auto& base = device.GetContext();
+    constexpr std::size_t unitBytes = 65536;
+    constexpr std::size_t allocationBytes = 6 * unitBytes;
+    constexpr std::size_t offset = 0x2000;
+    constexpr std::size_t surfaceBytes = 512 * 512;
+    const bool baselineRead = entry == "baseline-read";
+    const std::size_t headEdit = offset + (baselineRead ? 128 : 16);
+    constexpr std::size_t tailEdit = offset + surfaceBytes - 17;
+    Require(AgcDriver::GuestMemory::WriteWatched(), "mixed CPU edges require native write watching");
+    Require(!direct || base.hostImportAlignment != 0, "mixed CPU edges require host imports for the direct case");
+    std::size_t failedCases = 0;
+    for (const bool changed : {false, true}) {
+        struct Backing {
+            const Context& context;
+            Recorder& recorder;
+            bool direct;
+            void* block = nullptr;
+            std::int64_t physical = -1;
+            ~Backing() {
+                try {
+                    recorder.Sync();
+                } catch (const std::exception& error) {
+                    std::cerr << "mixed CPU edges: recorded work did not finish, memory stays mapped: " << error.what() << '\n';
+                    return;
+                }
+                if (direct) {
+                    if (block != nullptr) sceKernelMunmap(block, allocationBytes);
+                    if (physical >= 0) sceKernelReleaseDirectMemory(physical, allocationBytes);
+                } else if (block != nullptr) {
+                    {
+                        GuestAllocations::Mutation mutation;
+                        mutation.Remove(block);
+                    }
+                    HostImportFor(context, reinterpret_cast<std::uint64_t>(block), allocationBytes);
+                    ReleaseWatched(block, allocationBytes);
+                }
+            }
+        } backing{base, recorder, direct};
+        if (direct) {
+            Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, allocationBytes, unitBytes, 0, &backing.physical) == 0, "mixed CPU edges: allocate direct memory");
+            Require(sceKernelMapDirectMemory(&backing.block, allocationBytes, 0x33, 0, backing.physical, unitBytes) == 0, "mixed CPU edges: map direct memory");
+        } else {
+            backing.block = AllocateWatched(allocationBytes, unitBytes);
+            Require(backing.block != nullptr, "mixed CPU edges: allocate watched memory");
+            GuestAllocations::Mutation mutation;
+            mutation.Add(backing.block, allocationBytes, true, true, true);
+        }
+        auto* memory = static_cast<std::uint8_t*>(backing.block);
+        std::memset(memory, 0x19, allocationBytes);
+        std::memset(memory + offset, 0xcd, surfaceBytes);
+        const auto blockAddress = reinterpret_cast<std::uint64_t>(memory);
+        const auto address = blockAddress + offset;
+        Require(blockAddress % unitBytes == 0, "mixed CPU edges: backing is not 64 KiB aligned");
+        AgcDriver::GuestMemory::CollectWritesUncached(blockAddress, allocationBytes);
+        TextureDetiler detiler(base);
+        struct FinishBeforeDetiler {
+            Recorder& recorder;
+            ~FinishBeforeDetiler() {
+                try {
+                    recorder.Sync();
+                } catch (const std::exception& error) {
+                    std::cerr << "mixed CPU edges: recorder drain failed: " << error.what() << '\n';
+                }
+            }
+        } finish{recorder};
+        auto context = base;
+        if (!direct) context.hostImportAlignment = 0;
+        context.detiler = &detiler;
+        GuestTextureResource resource{};
+        resource.baseAddress = address;
+        resource.width = 512;
+        resource.height = 512;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kStandard4KB;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 1;
+        resource.dstSelX = 4;
+        resource.dstSelY = 4;
+        resource.dstSelZ = 4;
+        resource.dstSelW = 4;
+        Require(DescribeSurface(resource).guestBytes == surfaceBytes, "mixed CPU edges: unexpected surface size");
+        auto image = StorageTexture::Create(context, detiler, resource, 0);
+        Require((HostImportFor(context, address, surfaceBytes) != nullptr) == direct, "mixed CPU edges: the image did not use the requested import path");
+        const bool watched = AgcDriver::GuestMemory::Watched(address, surfaceBytes);
+        Require(direct || watched, "mixed CPU edges: staging memory lost its write watch");
+        const auto clear = [&](float red) {
+            const auto commands = recorder.Commands();
+            recorder.Keep(image);
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            const VkClearColorValue value{{red, 0.0f, 0.0f, 1.0f}};
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            image->MarkDirty();
+            recorder.Sync();
+        };
+        if (entry == "cycles") {
+            clear(0.0f);
+            image->WriteBack();
+            recorder.Sync();
+            Require(std::all_of(memory + offset, memory + offset + surfaceBytes, [](auto byte) { return byte == 0; }), "mixed CPU edges: first cycle did not reach guest memory");
+            image->Refresh();
+        }
+        clear(1.0f);
+        const std::uint8_t baseline = entry == "cycles" ? 0 : 0xcd;
+        if (baselineRead) {
+            for (std::size_t at = unitBytes; at < offset + surfaceBytes; at += unitBytes) memory[at] = baseline;
+        }
+        memory[headEdit] = changed ? 0x31 : baseline;
+        memory[tailEdit] = changed ? 0x72 : baseline;
+        AgcDriver::GuestMemory::CollectWritesUncached(blockAddress, allocationBytes);
+        std::array<std::byte, 32> smallRead{};
+        StorageTexture::AccessClassification classification{};
+        if (baselineRead) StorageTexture::ClassifyAccess(address, smallRead.size(), classification);
+        if (entry == "read" || baselineRead) AgcDriver::GuestMemory::Read(address, smallRead);
+        if (entry == "refresh") image->Refresh();
+        image->WriteBack();
+        recorder.Sync();
+        std::vector<std::byte> read(allocationBytes);
+        AgcDriver::GuestMemory::Read(blockAddress, read);
+        std::size_t headLost = 0, tailLost = 0, interiorLost = 0, cpuLost = 0, neighborsChanged = 0;
+        const auto expectedEdge = baselineRead && changed ? baseline : 0xff;
+        for (std::size_t at = 0; at < allocationBytes; ++at) {
+            const auto actual = std::to_integer<std::uint8_t>(read[at]);
+            if (at < offset || at >= offset + surfaceBytes) neighborsChanged += actual != 0x19;
+            else if (changed && at == headEdit) cpuLost += actual != 0x31;
+            else if (changed && at == tailEdit) cpuLost += actual != 0x72;
+            else if (at < unitBytes) headLost += actual != expectedEdge;
+            else if (at >= 4 * unitBytes) tailLost += actual != expectedEdge;
+            else interiorLost += actual != 0xff;
+        }
+        const std::string what = std::string(direct ? "imported" : "staging") + (watched ? " watched" : " compared") + (changed ? " changed CPU bytes " : " unchanged CPU stamps ") + std::string(entry);
+        std::cout << "mixed CPU edges: " << what << (baselineRead ? ": incorrect expected bytes head=" : ": lost GPU bytes head=") << headLost << " tail=" << tailLost << " interior=" << interiorLost << ", lost CPU edits=" << cpuLost << ", changed neighbor bytes=" << neighborsChanged << '\n';
+        std::size_t smallLost = 0;
+        if (entry == "read" || baselineRead) {
+            for (std::size_t at = 0; at < smallRead.size(); ++at) smallLost += smallRead[at] != (changed && at == headEdit - offset ? std::byte{0x31} : static_cast<std::byte>(expectedEdge));
+            std::cout << "mixed CPU edges: small read lost " << smallLost << " bytes before explicit write-back\n";
+        }
+        if (baselineRead) std::cout << "baseline read: classified as CPU-kept=" << classification.allCpuWritten << ", changed bytes outside read=" << changed << '\n';
+        failedCases += smallLost != 0 || cpuLost != 0 || neighborsChanged != 0 || interiorLost != 0 || headLost != 0 || tailLost != 0 || (baselineRead && watched && classification.allCpuWritten != changed);
+    }
+    Require(failedCases == 0, "mixed CPU edges: " + std::to_string(failedCases) + " cases returned incorrect bytes during " + std::string(entry));
+}
+
 void keptUnitSettleTests(const Device& device, Recorder& recorder) {
     Require(AgcDriver::GuestMemory::WriteWatched(), "(k) kept-unit settle tests require host write watching");
     const auto& base = device.GetContext();
@@ -10853,6 +10998,17 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--unchanged-cpu-stamps-only") {
             unchangedCpuStampTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && (std::string_view(argv[1]) == "--mixed-cpu-edges-only" || std::string_view(argv[1]) == "--mixed-cpu-edges-direct-only")) {
+            mixedCpuEdgeTests(device, recorder, std::string_view(argv[1]) == "--mixed-cpu-edges-direct-only");
+            return 0;
+        }
+        if (argc == 4 && std::string_view(argv[1]) == "--mixed-cpu-edges") {
+            const std::string_view entry(argv[2]);
+            Require(entry == "read" || entry == "refresh" || entry == "cycles" || entry == "baseline-read", "mixed CPU edges: unknown entry point");
+            Require(std::string_view(argv[3]) == "direct" || std::string_view(argv[3]) == "staging", "mixed CPU edges: unknown memory path");
+            mixedCpuEdgeTests(device, recorder, std::string_view(argv[3]) == "direct", entry);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--kept-unit-settle-only") {

@@ -4382,14 +4382,19 @@ bool StorageTexture::blocksKept(std::span<const std::shared_ptr<StorageTexture>>
     for (const auto& texture : images) {
         for (std::uint32_t layer = 0; layer < texture->trackedLayers; ++layer) {
             if (!texture->layerPending[layer]) continue;
-            const auto begin = std::max(address, texture->layerBegin(layer));
-            const auto end = std::min(accessEnd, texture->layerBegin(layer) + texture->layerBytes(layer));
+            const auto layerBegin = texture->layerBegin(layer);
+            const auto layerEnd = layerBegin + texture->layerBytes(layer);
+            const auto begin = std::max(address, layerBegin);
+            const auto end = std::min(accessEnd, layerEnd);
             if (end <= begin) continue;
             if (texture->layerGeneration[layer] == 0) return false;
             for (auto at = begin & ~(block - 1); at < end; at += block) {
                 const auto from = std::max(at, begin);
                 const auto to = std::min(at + block, end);
                 if (!GuestMemory::WrittenSince(from, static_cast<std::size_t>(to - from), texture->layerGeneration[layer])) return false;
+                const auto storedFrom = std::max(at, layerBegin);
+                const auto storedTo = std::min(at + block, layerEnd);
+                if (!texture->keptAtUnwatchHolds(storedFrom, layer) && texture->unchangedSinceBaseline(storedFrom, storedTo)) return false;
             }
         }
     }
@@ -4409,6 +4414,8 @@ void StorageTexture::ClassifyAccess(std::uint64_t address, std::size_t bytes, Ac
     if (bytes > ClassifyLimit) return;
     out.checked = true;
     GuestMemory::CollectWritesUncached(address, bytes);
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+    std::lock_guard gpu(GuestMemory::GpuMutex());
     out.allCpuWritten = blocksKept(overlapping, address, bytes);
 }
 
@@ -4485,7 +4492,9 @@ bool StorageTexture::evictStale(std::uint64_t address, std::size_t bytes, std::s
         const auto end = begin + layerBytes(layer);
         for (auto at = begin & ~(block - 1); at < end; at += block) {
             const auto from = std::max(at, begin);
-            if (!GuestMemory::WrittenSince(from, static_cast<std::size_t>(std::min(at + block, end) - from), layerGeneration[layer])) return false;
+            const auto to = std::min(at + block, end);
+            if (!GuestMemory::WrittenSince(from, static_cast<std::size_t>(to - from), layerGeneration[layer])) return false;
+            if (!keptAtUnwatchHolds(from, layer) && unchangedSinceBaseline(from, to)) return false;
         }
     }
     // As the empty write-back leaves the layers: no results pending, the generation unchanged (the
