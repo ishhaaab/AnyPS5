@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DEFERREDLABELS_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DEFERREDLABELS_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/LabelKind.hpp"
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -16,6 +17,7 @@ struct DeferredLabel {
     std::uint64_t address;
     std::size_t size;
     std::array<std::byte, Capacity> bytes;
+    LabelKind kind = LabelKind::Store;
 };
 
 struct DeferredLabels {

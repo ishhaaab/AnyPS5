@@ -43,7 +43,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             if (label.has_value()) {
                 const auto bytes = label->Bytes();
                 const auto stamp = ++eventSerial;
-                reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, submission.queue) : 4;
+                reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, submission.queue, true, label->kind) : 4;
                 if (reason == 1) GuestMemory::Write(label->address, bytes, 4);
                 if (reason == 0 || reason == 1 || reason == 5) {
                     noteLabelStore(label->address, bytes, stamp, submission.queue);
@@ -83,6 +83,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 auto& entry = deferred.labels.emplace_back();
                 entry.address = label->address;
                 entry.size = bytes.size();
+                entry.kind = label->kind;
                 std::memcpy(entry.bytes.data(), bytes.data(), bytes.size());
                 ++queuedLabels;
                 wroteOnGpu = true;
@@ -93,7 +94,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 const auto stamp = ++eventSerial;
-                const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, submission.queue) : 4;
+                const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, submission.queue, true, label->kind) : 4;
                 wroteOnGpu = reason == 0 || reason == 5;
                 if (reason == 1) {
 
@@ -412,12 +413,13 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
         writes.emplace_back(address, address + bytes.size());
     }
     if (endOfPipeInterrupt) bumpEpoch(&EpochBumps::drains);
+    const auto kind = label.has_value() ? label->kind : LabelKind::Release;
     auto stored = bytes;
     auto labelBytes = bytes;
-    auto enqueue =[this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt, writes, stored = std::move(stored)]() mutable {
-        DrawPipeline::Queue0().Enqueue([this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt] {
+    auto enqueue =[this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt, kind, writes, stored = std::move(stored)]() mutable {
+        DrawPipeline::Queue0().Enqueue([this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt, kind] {
             GuestMemory::SetCurrentPacket(opcode, queue);
-            commitLabel(queue, address, bytes, endOfPipeInterrupt);
+            commitLabel(queue, address, bytes, endOfPipeInterrupt, kind);
         }, std::move(writes), address, std::move(stored));
     };
     if (queue == 0 && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
@@ -433,7 +435,7 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
     return true;
 }
 
-void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool endOfPipeInterrupt) {
+void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool endOfPipeInterrupt, LabelKind kind) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto localDevice = device.Load();
@@ -442,7 +444,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     int reason = localDevice != nullptr ? 0 : 1;
     if (!bytes.empty()) {
         const auto stamp = ++eventSerial;
-        reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
+        reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue, true, kind) : 4;
         if (reason != 0 && reason != 5 && reason != 6) {
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(address, bytes, 4);

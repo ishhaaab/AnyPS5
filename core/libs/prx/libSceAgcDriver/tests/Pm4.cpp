@@ -531,6 +531,7 @@ void testMemory() {
     const auto fence = makePacket(0x37, {0x06100300, low(data.data()), high(data.data()), 0});
     const auto fenceLabel = AgcDriver::Pm4::DecodeLabelWrite(fence);
     check(fenceLabel.has_value() && fenceLabel->address == reinterpret_cast<std::uint64_t>(data.data()), "WRITE_DATA with destination 3 did not resolve as a label");
+    check(fenceLabel->kind == AgcDriver::LabelKind::Store, "WRITE_DATA acquired release completion semantics");
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x37, {0x100000, low(data.data()), high(data.data()), 1}), 0); }, "register destination");
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x37, {0x08000100, low(data.data()), high(data.data()), 71}), 0); }, "reserved");
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x37, {0x80000100, low(data.data()), high(data.data()), 51}), 0); }, "engine");
@@ -1123,6 +1124,13 @@ void testReleaseMemDataSelects() {
     alignas(8) static std::uint64_t target = 0;
     const auto release = [](std::uint32_t select) { return makePacket(0x49, {0x0030c514, select << 29u, low(&target), high(&target), 1, 0, 0}); };
     for (std::uint32_t select = 0; select <= 3; ++select) AgcDriver::Pm4::Validate(release(select), 0);
+    for (std::uint32_t select = 1; select <= 3; ++select) {
+        const auto packet = release(select);
+        const auto label = AgcDriver::Pm4::DecodeLabelWrite(packet);
+        check(label.has_value() && label->kind == AgcDriver::LabelKind::Release, "RELEASE_MEM lost its completion semantics");
+        check(label->Bytes().size() == (select == 1 ? 4 : 8), "RELEASE_MEM changed its label width");
+    }
+    check(!AgcDriver::Pm4::DecodeLabelWrite(release(0)), "a release without data became a memory store");
     expectFailure([&] { AgcDriver::Pm4::Validate(release(4), 0); }, "64-bit system counter (DATA_SEL 4)");
     expectFailure([&] { AgcDriver::Pm4::Validate(release(5), 0); }, "GDS RELEASE_MEM data");
     for (const auto select : {6u, 7u}) expectFailure([&] { AgcDriver::Pm4::Validate(release(select), 0); }, "reserved RELEASE_MEM DATA_SEL");

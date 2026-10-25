@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LabelKind.hpp"
 #include <cstddef>
 #include <vector>
 #include <optional>
@@ -118,6 +119,7 @@ struct LabelWrite {
     std::span<const std::byte> packetBytes;
     std::array<std::byte, 8> inlineBytes{};
     std::size_t inlineSize = 0;
+    LabelKind kind = LabelKind::Store;
     std::span<const std::byte> Bytes() const { return inlineSize != 0 ? std::span<const std::byte>(inlineBytes).first(inlineSize) : packetBytes; }
 };
 std::optional<LabelWrite> DecodeLabelWrite(std::span<const std::uint32_t> packet);

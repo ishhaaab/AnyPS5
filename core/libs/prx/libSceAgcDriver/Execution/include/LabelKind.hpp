@@ -1,0 +1,10 @@
+#ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_LABELKIND_HPP
+#define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_LABELKIND_HPP
+
+namespace AgcDriver {
+
+enum class LabelKind { Store, Release };
+
+}
+
+#endif
